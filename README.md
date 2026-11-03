@@ -45,8 +45,8 @@ hand-built byte strings and no root access.
 ## Usage
 
 ```bash
-git clone https://github.com/23rob/packet-sniffer.git
-cd packet-sniffer
+git clone https://github.com/23rob/raw-packet-analyzer.git
+cd raw-packet-analyzer
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
