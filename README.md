@@ -16,7 +16,7 @@ No Scapy, no libpcap, no third-party runtime dependencies.
 | 2 | IPv4 header parsing, RFC 1071 checksum, fragments, options | ✅ Done |
 | 3 | TCP / UDP / ICMP parsing, pseudo-header checksums, TCP options | ✅ Done |
 | 4 | Threaded pipeline, bounded queues, drop accounting, JSON Lines logging | ✅ Done |
-| 5 | Threat detection: SYN flood, port scans, JSON alerts | ⏳ Next |
+| 5 | Threat detection: SYN flood, port scans, stealth-flag probes, sensor-health alerts | ✅ Done |
 
 ## Architecture
 
@@ -73,6 +73,9 @@ sudo .venv/bin/python -m sniffer -i eth0 -e
 
 # Log every packet as JSON Lines (for jq, Splunk, Elastic) and report health every 5s
 sudo .venv/bin/python -m sniffer -i eth0 -q --json packets.jsonl --stats 5
+
+# Run the threat detector, writing alerts to a JSON Lines file (on by default)
+sudo .venv/bin/python -m sniffer -i eth0 -q --alerts alerts.jsonl
 ```
 
 Example output (live capture; `-e` adds the Ethernet and full IPv4 lines):
@@ -122,6 +125,42 @@ buffers are the next steps for real line-rate capture.
 
 `examples/race_demo.py` shows why shared counters use a lock: without one,
 8 threads lose about a third of 160,000 increments.
+
+## Threat detection (Milestone 5)
+
+The detector runs as another pipeline sink, so adding it changed no existing
+code. It combines three kinds of detection:
+
+* **Stateless signatures** — one packet is enough: impossible TCP flag
+  combinations (NULL, Xmas, SYN+FIN), the IPv4 source-route and reserved
+  ("evil") bits, and RFC 1858 tiny first fragments.
+* **Stateful thresholds** over a sliding window of event time: SYN floods
+  (keyed on the victim, so spoofed sources can't dodge it), vertical port
+  scans (many ports on one host) and horizontal sweeps (one port across many
+  hosts).
+* **Sensor health** — a meta-alert when the sniffer itself is dropping a
+  sustained fraction of traffic, because every other rule is then partly
+  blind (the "sensor-blinding" evasion).
+
+Each alert carries a severity and MITRE ATT&CK technique IDs (T1046,
+T1499.001, T1595.001). Engineering notes:
+
+* **Bounded state.** Every per-key table is an LRU cache with a hard size
+  limit, so a spoofed flood with random source addresses can't turn the
+  detector into the memory-exhaustion target — the same lesson as the
+  bounded queues in Milestone 4. Evictions are counted, not silent.
+* **Event time, not wall-clock.** Windows use each frame's capture
+  timestamp and a monotonic clock, so queueing delay and NTP steps don't
+  distort rates, and the engine is deterministic under test.
+* **Alert fatigue.** Each (rule, entity) pair has a cooldown; suppressed
+  repeats are counted and reported with the next alert.
+* **Insertion-attack defense.** Packets with a genuinely bad checksum are
+  ignored (the real target drops them too), but offloaded `CHECKSUM_PARTIAL`
+  packets — every loopback and locally generated one — are still inspected.
+
+`examples/detection_demo.py` drives all of this end-to-end through the real
+pipeline with in-memory packet bytes (no network, no root), and
+`tests/test_detection.py` covers each rule with synthetic timestamped events.
 
 ## Development
 
