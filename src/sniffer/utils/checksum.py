@@ -65,3 +65,33 @@ def internet_checksum(data: bytes) -> int:
     To *verify* one, call it over the data as received: 0 means valid.
     """
     return ~ones_complement_sum(data) & _MASK16
+
+
+# Pseudo-header: source IP (4) + destination IP (4) + zero (1) + protocol (1)
+# + TCP/UDP length (2) = 12 bytes. "4s4sxBH": "x" is a single pad byte.
+_PSEUDO_HEADER: Final = struct.Struct("!4s4sxBH")
+MAX_PSEUDO_HEADER_LENGTH: Final[int] = 0xFFFF  # the length field is 16 bits
+
+
+def pseudo_header(src: bytes, dst: bytes, protocol: int, length: int) -> bytes:
+    """Build the 12-byte IPv4 pseudo-header for TCP/UDP checksums.
+
+    The pseudo-header is never transmitted. Both ends construct it from the
+    IP header and prepend it to the segment before summing. Including the
+    addresses and protocol means a packet that arrives at the wrong host or
+    protocol fails the transport checksum, even if its IP checksum is fine
+    (RFC 9293 section 3.1, RFC 768).
+
+    Args:
+        src: Source address as 4 packed bytes (``IPv4Address.packed``).
+        dst: Destination address as 4 packed bytes.
+        protocol: IP protocol number (6 for TCP, 17 for UDP).
+        length: Length of the TCP or UDP segment, header + data.
+
+    """
+    return _PSEUDO_HEADER.pack(src, dst, protocol, length)
+
+
+def transport_checksum(src: bytes, dst: bytes, protocol: int, segment: bytes) -> int:
+    """RFC 1071 checksum over pseudo-header + segment. 0 means valid."""
+    return internet_checksum(pseudo_header(src, dst, protocol, len(segment)) + segment)

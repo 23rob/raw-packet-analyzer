@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 
 from sniffer import __version__
 from sniffer.capture import PacketType, RawFrame, RawSocketCapture
+from sniffer.decode import Transport, decode_frame
 from sniffer.exceptions import PacketParseError, SnifferError
-from sniffer.protocols.ethernet import EtherType, parse_ethernet
-from sniffer.protocols.ipv4 import parse_ipv4
+from sniffer.protocols.ipv4 import IPv4Packet
+from sniffer.protocols.tcp import TCPSegment
+from sniffer.protocols.udp import UDPDatagram
 from sniffer.utils.hexdump import hexdump
 
 logger = logging.getLogger("sniffer")
@@ -59,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-e",
         "--ethernet",
         action="store_true",
-        help="also show the Ethernet (MAC) layer for IP packets",
+        help="also show the Ethernet and full IPv4 layers for IP packets",
     )
     parser.add_argument(
         "-x",
@@ -83,39 +85,72 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _checksum_label(valid: bool | None, pkttype: int) -> str:
+    """Turn a checksum result into ``ok``, ``BAD``, ``offload`` or ``n/a``.
+
+    Checksum offload: the kernel copies outgoing packets to sniffers BEFORE
+    the NIC finishes the TCP/UDP checksum (the field holds only the partial
+    pseudo-header sum, the kernel's CHECKSUM_PARTIAL state). So a "bad"
+    checksum on an OUTGOING packet is expected, not an attack. Labelling it
+    honestly avoids a flood of false alarms.
+    """
+    if valid is None:
+        return "n/a"
+    if valid:
+        return "ok"
+    return "offload" if pkttype == PacketType.OUTGOING else "BAD"
+
+
+def _endpoint(ip: IPv4Packet, transport: Transport | None) -> str:
+    """``a.b.c.d:port -> e.f.g.h:port``, or bare addresses without ports."""
+    if isinstance(transport, (TCPSegment, UDPDatagram)):
+        return f"{ip.src}:{transport.src_port} -> {ip.dst}:{transport.dst_port}"
+    return f"{ip.src} -> {ip.dst}"
+
+
 def format_frame(index: int, frame: RawFrame, *, show_ethernet: bool = False) -> str:
     """Render one captured frame as a single summary line.
 
-    Decoding is layered like the protocols themselves: Ethernet first, then
-    the EtherType decides which layer 3 parser runs next. This "dispatch on
-    the next-protocol field" pattern repeats at every layer (IPv4's Protocol
-    field picks TCP/UDP/ICMP in Milestone 3).
+    All protocol logic lives in ``decode_frame``. This function only turns
+    the decoded layers into text, so it is the only part that changes when
+    the output format changes (to JSON logs in Milestone 4, for example).
     """
     ts = datetime.fromtimestamp(frame.timestamp, tz=timezone.utc).strftime(
         "%H:%M:%S.%f"
     )
     prefix = f"#{index:<5} {ts} {frame.interface:<8} {frame.direction:<9}"
     try:
-        eth = parse_ethernet(frame.data)
-        if eth.ethertype != EtherType.IPV4:
-            return f"{prefix} {eth.summary()}"
-        ip = parse_ipv4(eth.payload)
+        pkt = decode_frame(frame.data)
     except PacketParseError as exc:
         # A malformed frame must never crash a sniffer: log it and move on.
         # Attackers send malformed packets precisely to crash parsers.
         return f"{prefix} <malformed: {exc}>"
 
-    line = f"{prefix} {ip.summary()}"
-    if not ip.checksum_valid and frame.pkttype == PacketType.OUTGOING:
-        # Checksum offload: some NICs fill in checksums AFTER the kernel
-        # handed us our copy, so outgoing packets can look "bad". On Linux
-        # the IPv4 *header* checksum is normally computed in software (live
-        # tests show chk=ok on outgoing frames), but TCP/UDP checksums are
-        # routinely offloaded, which matters in Milestone 3. Labelling these
-        # honestly avoids a false alarm.
-        line = line.replace("chk=BAD", "chk=offload")
+    ip = pkt.ip
+    if ip is None:
+        return f"{prefix} {pkt.ethernet.summary()}"
+
+    ip_chk = _checksum_label(ip.checksum_valid, frame.pkttype)
+    parts = [prefix, _endpoint(ip, pkt.transport), ip.protocol_name]
+    if pkt.transport is not None:
+        parts.append(pkt.transport.summary())
+        l4_chk = (
+            "partial"
+            if pkt.transport_checksum_partial
+            else _checksum_label(pkt.transport_checksum_valid, frame.pkttype)
+        )
+    elif pkt.transport_error is not None:
+        parts.append(f"<malformed {ip.protocol_name}: {pkt.transport_error}>")
+        l4_chk = "n/a"
+    else:
+        l4_chk = "n/a"
+    if ip.is_fragment:
+        parts.append(f"frag@{ip.fragment_offset}{'+MF' if ip.more_fragments else ''}")
+    parts.append(f"ttl={ip.ttl} chk={ip_chk}/{l4_chk}")
+    line = " ".join(parts)
     if show_ethernet:
-        line += f"\n{'':>41}{eth.summary()}"
+        line += f"\n{'':>41}{pkt.ethernet.summary()}"
+        line += f"\n{'':>41}{ip.summary()}"
     return line
 
 
