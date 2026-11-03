@@ -121,3 +121,13 @@ def test_other_protocol_has_no_transport() -> None:
 def test_non_ip_frame() -> None:
     pkt = decode_frame(build_frame(b"\x00" * 28, ethertype=0x0806))
     assert pkt.ip is None
+
+
+def test_big_tcp_super_packet_does_not_crash() -> None:
+    # Regression (Codex review on PR #2): a >64 KiB GSO packet used to raise
+    # struct.error building the pseudo-header and kill the sniffer.
+    segment = build_tcp(payload=bytes(70_000), checksum=0)
+    pkt = decode_frame(build_frame(build_ipv4(payload=segment, total_length=0)))
+    assert isinstance(pkt.transport, TCPSegment)
+    assert pkt.transport_checksum_valid is None
+    assert not pkt.transport_checksum_partial

@@ -70,6 +70,7 @@ def internet_checksum(data: bytes) -> int:
 # Pseudo-header: source IP (4) + destination IP (4) + zero (1) + protocol (1)
 # + TCP/UDP length (2) = 12 bytes. "4s4sxBH": "x" is a single pad byte.
 _PSEUDO_HEADER: Final = struct.Struct("!4s4sxBH")
+MAX_PSEUDO_HEADER_LENGTH: Final[int] = 0xFFFF  # the length field is 16 bits
 
 
 def pseudo_header(src: bytes, dst: bytes, protocol: int, length: int) -> bytes:

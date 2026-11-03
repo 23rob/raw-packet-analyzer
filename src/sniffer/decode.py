@@ -29,6 +29,7 @@ from sniffer.protocols.ipv4 import IPProtocol, IPv4Packet, parse_ipv4
 from sniffer.protocols.tcp import TCPSegment, parse_tcp
 from sniffer.protocols.udp import UDPDatagram, parse_udp
 from sniffer.utils.checksum import (
+    MAX_PSEUDO_HEADER_LENGTH,
     ones_complement_sum,
     pseudo_header,
     transport_checksum,
@@ -59,6 +60,12 @@ def _verify_transport_checksum(ip: IPv4Packet, transport: Transport) -> bool | N
     if ip.truncated or ip.is_fragment:
         # The checksum covers the entire original datagram. With only part
         # of it (snaplen cut, or one fragment), verification is impossible.
+        return None
+    if len(ip.payload) > MAX_PSEUDO_HEADER_LENGTH:
+        # A BIG TCP super-packet (IPv4 total_length 0, buffer > 64 KiB) has
+        # no checksum of its own: the NIC computes one per real packet after
+        # splitting it. Its length also cannot fit the pseudo-header's
+        # 16-bit field, so there is nothing meaningful to verify.
         return None
     if isinstance(transport, ICMPMessage):
         return transport.checksum_valid  # ICMP verifies itself, no pseudo-header
