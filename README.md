@@ -13,8 +13,8 @@ No Scapy, no libpcap, no third-party runtime dependencies.
 | Milestone | Scope | Status |
 |---|---|---|
 | 1 | Raw `AF_PACKET` capture, Ethernet II + 802.1Q decoding, hex dump | ✅ Done |
-| 2 | IPv4 header parsing, checksum verification | ⏳ Next |
-| 3 | TCP / UDP / ICMP parsing | ⬜ |
+| 2 | IPv4 header parsing, RFC 1071 checksum, fragments, options | ✅ Done |
+| 3 | TCP / UDP / ICMP parsing | ⏳ Next |
 | 4 | Multi-threaded capture → queue → workers pipeline | ⬜ |
 | 5 | Threat detection: SYN flood, port scans, JSON alerts | ⬜ |
 
@@ -28,7 +28,10 @@ No Scapy, no libpcap, no third-party runtime dependencies.
                                                      │ RawFrame(bytes + kernel metadata)
                                                      ▼
                         protocols/   parse_ethernet()  (pure functions of bytes)
-                                                     │ EthernetFrame
+                                                     │ EthernetFrame ── EtherType 0x0800?
+                                                     ▼
+                        protocols/   parse_ipv4()      (validates lengths, RFC 1071 checksum)
+                                                     │ IPv4Packet
                                                      ▼
                         cli.py       formatting, exit codes
 ```
@@ -55,15 +58,23 @@ sudo .venv/bin/python -m sniffer -c 10
 
 # One interface, promiscuous mode, with hex dumps
 sudo .venv/bin/python -m sniffer -i eth0 -p -x
+
+# Show the Ethernet layer under each IP packet
+sudo .venv/bin/python -m sniffer -i eth0 -e
 ```
 
-Example output:
+Example output (`-e` adds the Ethernet line):
 
 ```
-#1     15:07:04.126011 eth0     HOST      02:fc:00:00:00:05 -> 02:fc:00:00:00:01 type=IPV4 (0x0800) payload=644B
-0000  02 fc 00 00 00 01 02 fc  00 00 00 05 08 00 45 00  |..............E.|
-0010  02 84 9b d0 40 00 3f 06  d3 47 a0 4f 68 0a c0 00  |....@.?..G.Oh...|
+#1     16:01:07.596097 eth0     HOST      160.79.104.10 -> 192.0.2.2 TCP ttl=63 len=645 id=0xd06b [DF] chk=ok
+                                         02:fc:00:00:00:05 -> 02:fc:00:00:00:01 type=IPV4 (0x0800) payload=645B
+#2     16:01:07.596305 eth0     OUTGOING  192.0.2.2 -> 160.79.104.10 TCP ttl=64 len=52 id=0xea7c [DF] chk=ok
+#5     16:01:07.827230 eth0     OUTGOING  192.0.2.2 -> 34.149.66.165 TCP ttl=64 len=6773 id=0xa993 [DF] chk=ok
 ```
+
+Frame #5 is larger than the 1500-byte MTU: that is TCP Segmentation Offload.
+The kernel hands the NIC one big segment and the hardware splits it, so the
+sniffer sees the pre-split packet.
 
 Running without privileges gives a clear error rather than a traceback:
 

@@ -16,9 +16,10 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from sniffer import __version__
-from sniffer.capture import RawFrame, RawSocketCapture
+from sniffer.capture import PacketType, RawFrame, RawSocketCapture
 from sniffer.exceptions import PacketParseError, SnifferError
-from sniffer.protocols.ethernet import parse_ethernet
+from sniffer.protocols.ethernet import EtherType, parse_ethernet
+from sniffer.protocols.ipv4 import parse_ipv4
 from sniffer.utils.hexdump import hexdump
 
 logger = logging.getLogger("sniffer")
@@ -34,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Define the command-line interface."""
     parser = argparse.ArgumentParser(
         prog="sniffer",
-        description="Raw-socket packet sniffer (Milestone 1: Ethernet decoding).",
+        description="Raw-socket packet sniffer and traffic analyzer.",
     )
     parser.add_argument(
         "-i",
@@ -53,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--promiscuous",
         action="store_true",
         help="put the interface in promiscuous mode (requires -i)",
+    )
+    parser.add_argument(
+        "-e",
+        "--ethernet",
+        action="store_true",
+        help="also show the Ethernet (MAC) layer for IP packets",
     )
     parser.add_argument(
         "-x",
@@ -76,19 +83,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def format_frame(index: int, frame: RawFrame) -> str:
-    """Render one captured frame as a single summary line."""
+def format_frame(index: int, frame: RawFrame, *, show_ethernet: bool = False) -> str:
+    """Render one captured frame as a single summary line.
+
+    Decoding is layered like the protocols themselves: Ethernet first, then
+    the EtherType decides which layer 3 parser runs next. This "dispatch on
+    the next-protocol field" pattern repeats at every layer (IPv4's Protocol
+    field picks TCP/UDP/ICMP in Milestone 3).
+    """
     ts = datetime.fromtimestamp(frame.timestamp, tz=timezone.utc).strftime(
         "%H:%M:%S.%f"
     )
     prefix = f"#{index:<5} {ts} {frame.interface:<8} {frame.direction:<9}"
     try:
         eth = parse_ethernet(frame.data)
+        if eth.ethertype != EtherType.IPV4:
+            return f"{prefix} {eth.summary()}"
+        ip = parse_ipv4(eth.payload)
     except PacketParseError as exc:
         # A malformed frame must never crash a sniffer: log it and move on.
         # Attackers send malformed packets precisely to crash parsers.
         return f"{prefix} <malformed: {exc}>"
-    return f"{prefix} {eth.summary()}"
+
+    line = f"{prefix} {ip.summary()}"
+    if not ip.checksum_valid and frame.pkttype == PacketType.OUTGOING:
+        # Checksum offload: some NICs fill in checksums AFTER the kernel
+        # handed us our copy, so outgoing packets can look "bad". On Linux
+        # the IPv4 *header* checksum is normally computed in software (live
+        # tests show chk=ok on outgoing frames), but TCP/UDP checksums are
+        # routinely offloaded, which matters in Milestone 3. Labelling these
+        # honestly avoids a false alarm.
+        line = line.replace("chk=BAD", "chk=offload")
+    if show_ethernet:
+        line += f"\n{'':>41}{eth.summary()}"
+    return line
 
 
 def run(args: argparse.Namespace) -> int:
@@ -102,7 +130,7 @@ def run(args: argparse.Namespace) -> int:
             " (promiscuous)" if args.promiscuous else "",
         )
         for index, frame in enumerate(capture.frames(args.count), start=1):
-            print(format_frame(index, frame))
+            print(format_frame(index, frame, show_ethernet=args.ethernet))
             if args.hexdump:
                 print(hexdump(frame.data, max_bytes=args.hexdump_bytes), end="\n\n")
     return EXIT_OK
