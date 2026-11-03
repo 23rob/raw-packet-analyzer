@@ -15,8 +15,8 @@ No Scapy, no libpcap, no third-party runtime dependencies.
 | 1 | Raw `AF_PACKET` capture, Ethernet II + 802.1Q decoding, hex dump | ✅ Done |
 | 2 | IPv4 header parsing, RFC 1071 checksum, fragments, options | ✅ Done |
 | 3 | TCP / UDP / ICMP parsing, pseudo-header checksums, TCP options | ✅ Done |
-| 4 | Multi-threaded capture → queue → workers pipeline | ⏳ Next |
-| 5 | Threat detection: SYN flood, port scans, JSON alerts | ⬜ |
+| 4 | Threaded pipeline, bounded queues, drop accounting, JSON Lines logging | ✅ Done |
+| 5 | Threat detection: SYN flood, port scans, JSON alerts | ⏳ Next |
 
 ## Architecture
 
@@ -36,7 +36,12 @@ No Scapy, no libpcap, no third-party runtime dependencies.
                         protocols/   parse_tcp() / parse_udp() / parse_icmp()
                                                      │
                         decode.py    decode_frame() → DecodedPacket (all layers + L4 checksum)
-                                                     ▼
+
+Milestone 4 runs that chain inside a threaded pipeline:
+
+ [capture thread] --put_nowait--> bounded queue --> [decoder worker(s)] --> bounded queue --> [sink thread]
+   recvfrom only     full? count the drop             PacketEvent (frozen)    backpressure     console / JSON Lines
+
                         cli.py       formatting, exit codes
 ```
 
@@ -65,6 +70,9 @@ sudo .venv/bin/python -m sniffer -i eth0 -p -x
 
 # Show the Ethernet layer under each IP packet
 sudo .venv/bin/python -m sniffer -i eth0 -e
+
+# Log every packet as JSON Lines (for jq, Splunk, Elastic) and report health every 5s
+sudo .venv/bin/python -m sniffer -i eth0 -q --json packets.jsonl --stats 5
 ```
 
 Example output (live capture; `-e` adds the Ethernet and full IPv4 lines):
@@ -91,6 +99,29 @@ Running without privileges gives a clear error rather than a traceback:
 ```
 ERROR: Raw sockets need the CAP_NET_RAW capability. Run with: sudo python -m sniffer ...
 ```
+
+## Performance and drop accounting
+
+Every frame is accounted for: `captured == queue_dropped + processed`, and the
+kernel's own drop counter (`PACKET_STATISTICS`) is reported next to it, so
+silent kernel drops are visible too.
+
+Loopback flood benchmark (2.6 million UDP datagrams in 4 s, which loopback turns into about
+10.5 million frames counting ICMP replies and both directions):
+
+| Decoder workers | Frames captured | Kernel drops |
+|---|---|---|
+| 1 | 79,074 | 11.1 M |
+| 2 | 69,559 | 10.8 M |
+| 4 | 54,644 | 9.7 M |
+
+Two lessons: the bottleneck is per-packet Python work on the capture path, not
+the queue (it never filled); and adding threads *reduces* throughput because
+they compete for the GIL. Kernel-side BPF filtering and `PACKET_MMAP` ring
+buffers are the next steps for real line-rate capture.
+
+`examples/race_demo.py` shows why shared counters use a lock: without one,
+8 threads lose about a third of 160,000 increments.
 
 ## Development
 

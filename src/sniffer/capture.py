@@ -65,6 +65,11 @@ ETH_P_ALL: Final[int] = 0x0003  # <linux/if_ether.h>: every protocol
 SOL_PACKET: Final[int] = 263  # <linux/socket.h>
 PACKET_ADD_MEMBERSHIP: Final[int] = 1  # <linux/if_packet.h>
 PACKET_MR_PROMISC: Final[int] = 1  # <linux/if_packet.h>
+PACKET_STATISTICS: Final[int] = 6  # <linux/if_packet.h>
+
+# struct tpacket_stats { unsigned int tp_packets; unsigned int tp_drops; }
+# Reading it RESETS both counters in the kernel, so callers must accumulate.
+_TPACKET_STATS: Final = struct.Struct("=II")
 
 # struct packet_mreq { int mr_ifindex; unsigned short mr_type;
 #                      unsigned short mr_alen; unsigned char mr_address[8]; }
@@ -99,6 +104,20 @@ class PacketType(IntEnum):
     LOOPBACK = 5
     USER = 6
     KERNEL = 7
+
+
+@dataclass(frozen=True, slots=True)
+class KernelStats:
+    """Counters the kernel keeps for an AF_PACKET socket (since last read).
+
+    ``packets`` counts every frame the socket was offered, *including* the
+    dropped ones (the kernel adds tp_drops into tp_packets before returning).
+    ``drops`` counts frames thrown away because our receive buffer was full:
+    the "silent" drops that happen when user space reads too slowly.
+    """
+
+    packets: int
+    drops: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +283,20 @@ class RawSocketCapture:
         return RawFrame(
             data=data, timestamp=time.time(), interface=ifname, pkttype=pkttype
         )
+
+    def kernel_stats(self) -> KernelStats | None:
+        """Read (and reset) the kernel's packet and drop counters.
+
+        Returns None if the socket is closed. Safe to call from another
+        thread while recv() is running: getsockopt does not touch the
+        receive queue.
+        """
+        sock = self._sock
+        if sock is None:
+            return None
+        raw = sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, _TPACKET_STATS.size)
+        packets, drops = _TPACKET_STATS.unpack(raw)
+        return KernelStats(packets=packets, drops=drops)
 
     def frames(self, count: int | None = None) -> Iterator[RawFrame]:
         """Yield frames forever, or until ``count`` frames have been read.

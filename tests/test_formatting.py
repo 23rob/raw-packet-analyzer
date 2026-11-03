@@ -1,9 +1,9 @@
-"""Tests for frame formatting in the CLI."""
+"""Tests for console formatting of decoded packets."""
 
 from __future__ import annotations
 
 from sniffer.capture import PacketType, RawFrame
-from sniffer.cli import format_frame
+from sniffer.formatting import format_frame
 from tests.packets import build_frame, build_icmp, build_ipv4, build_tcp, build_udp
 from tests.test_tcp import REAL_SYN
 
