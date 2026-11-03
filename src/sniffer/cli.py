@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
 from collections.abc import Sequence
@@ -49,8 +50,10 @@ def _positive_int(text: str) -> int:
 
 def _positive_float(text: str) -> float:
     value = float(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+    # Reject inf and nan: float("inf") parses fine but a never-expiring
+    # window would let detector state grow without bound (see DetectionConfig).
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive, finite number")
     return value
 
 

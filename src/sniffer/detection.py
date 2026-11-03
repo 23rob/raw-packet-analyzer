@@ -57,6 +57,7 @@ adversary behaviour it represents:
 
 from __future__ import annotations
 
+import math
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable
@@ -155,10 +156,14 @@ class DetectionConfig:
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be at least 1")
-        if self.window_s <= 0:
-            raise ValueError("window_s must be positive")
-        if self.cooldown_s < 0:
-            raise ValueError("cooldown_s must not be negative")
+        # math.isfinite rejects inf and nan. Without this, --window inf would
+        # pass "<= 0" yet make every rate-window bucket live forever, so a
+        # long-running detector grows per-key state without bound despite the
+        # key cap -- turning the detector into the memory-exhaustion target.
+        if not math.isfinite(self.window_s) or self.window_s <= 0:
+            raise ValueError("window_s must be a positive, finite number")
+        if not math.isfinite(self.cooldown_s) or self.cooldown_s < 0:
+            raise ValueError("cooldown_s must be a non-negative, finite number")
 
 
 # ---------------------------------------------------------------------------

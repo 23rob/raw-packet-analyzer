@@ -412,6 +412,15 @@ class TestEvasionAndHygiene:
         with pytest.raises(ValueError, match="window_s"):
             DetectionConfig(window_s=0)
 
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    def test_non_finite_window_is_rejected(self, bad: float) -> None:
+        # inf/nan slip past a "<= 0" check; an inf window would make every
+        # rate bucket live forever and grow memory without bound.
+        with pytest.raises(ValueError, match="window_s"):
+            DetectionConfig(window_s=bad)
+        with pytest.raises(ValueError, match="cooldown_s"):
+            DetectionConfig(cooldown_s=bad)
+
 
 # -- health monitor ---------------------------------------------------------------
 
