@@ -14,8 +14,8 @@ No Scapy, no libpcap, no third-party runtime dependencies.
 |---|---|---|
 | 1 | Raw `AF_PACKET` capture, Ethernet II + 802.1Q decoding, hex dump | ✅ Done |
 | 2 | IPv4 header parsing, RFC 1071 checksum, fragments, options | ✅ Done |
-| 3 | TCP / UDP / ICMP parsing | ⏳ Next |
-| 4 | Multi-threaded capture → queue → workers pipeline | ⬜ |
+| 3 | TCP / UDP / ICMP parsing, pseudo-header checksums, TCP options | ✅ Done |
+| 4 | Multi-threaded capture → queue → workers pipeline | ⏳ Next |
 | 5 | Threat detection: SYN flood, port scans, JSON alerts | ⬜ |
 
 ## Architecture
@@ -31,7 +31,11 @@ No Scapy, no libpcap, no third-party runtime dependencies.
                                                      │ EthernetFrame ── EtherType 0x0800?
                                                      ▼
                         protocols/   parse_ipv4()      (validates lengths, RFC 1071 checksum)
-                                                     │ IPv4Packet
+                                                     │ IPv4Packet ── Protocol 6 / 17 / 1?
+                                                     ▼
+                        protocols/   parse_tcp() / parse_udp() / parse_icmp()
+                                                     │
+                        decode.py    decode_frame() → DecodedPacket (all layers + L4 checksum)
                                                      ▼
                         cli.py       formatting, exit codes
 ```
@@ -63,18 +67,24 @@ sudo .venv/bin/python -m sniffer -i eth0 -p -x
 sudo .venv/bin/python -m sniffer -i eth0 -e
 ```
 
-Example output (`-e` adds the Ethernet line):
+Example output (live capture; `-e` adds the Ethernet and full IPv4 lines):
 
 ```
-#1     16:01:07.596097 eth0     HOST      160.79.104.10 -> 192.0.2.2 TCP ttl=63 len=645 id=0xd06b [DF] chk=ok
-                                         02:fc:00:00:00:05 -> 02:fc:00:00:00:01 type=IPV4 (0x0800) payload=645B
-#2     16:01:07.596305 eth0     OUTGOING  192.0.2.2 -> 160.79.104.10 TCP ttl=64 len=52 id=0xea7c [DF] chk=ok
-#5     16:01:07.827230 eth0     OUTGOING  192.0.2.2 -> 34.149.66.165 TCP ttl=64 len=6773 id=0xa993 [DF] chk=ok
+#1  lo    OUTGOING  127.0.0.1:35998 -> 127.0.0.1:9 UDP len=5 ttl=64 chk=ok/partial
+#3  lo    OUTGOING  127.0.0.1 -> 127.0.0.1 ICMP DEST_UNREACHABLE (port) len=33 ttl=64 chk=ok/ok
+#5  eth0  OUTGOING  192.0.2.2:53844 -> 151.101.128.223:443 TCP [SYN] seq=3919551076 win=65280 mss=1360 len=0 ttl=64 chk=ok/partial
+#6  eth0  HOST      151.101.128.223:443 -> 192.0.2.2:53844 TCP [SYN|ACK] seq=3580150793 ack=3919551077 win=43440 mss=1460 len=0 ttl=63 chk=ok/partial
 ```
 
-Frame #5 is larger than the 1500-byte MTU: that is TCP Segmentation Offload.
-The kernel hands the NIC one big segment and the hardware splits it, so the
-sniffer sees the pre-split packet.
+`chk=` shows the IPv4 header checksum / the transport checksum:
+
+| Label | Meaning |
+|---|---|
+| `ok` | Verified with RFC 1071 (TCP/UDP include the pseudo-header) |
+| `BAD` | Failed verification on a received packet |
+| `partial` | The field holds exactly the pseudo-header sum: the kernel's `CHECKSUM_PARTIAL` state, finished later by the NIC (common on loopback and virtual NICs) |
+| `offload` | Failed on an outgoing packet, where hardware fills it in after capture |
+| `n/a` | Cannot be checked: fragment, truncated capture, or UDP checksum 0 |
 
 Running without privileges gives a clear error rather than a traceback:
 
