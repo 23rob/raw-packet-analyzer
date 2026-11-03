@@ -92,10 +92,17 @@ def test_truncated_capture_is_flagged() -> None:
     assert len(ip.payload) == 40
 
 
-def test_total_length_zero_uses_buffer() -> None:
-    ip = parse_ipv4(build_ipv4(payload=bytes(10), total_length=0))
-    assert len(ip.payload) == 10
+def test_total_length_zero_accepted_for_big_tcp_super_packet() -> None:
+    # BIG TCP: a GSO/GRO packet over 65,535 bytes carries total_length 0.
+    ip = parse_ipv4(build_ipv4(payload=bytes(70_000), total_length=0))
+    assert len(ip.payload) == 70_000
     assert not ip.truncated
+
+
+def test_total_length_zero_rejected_on_normal_sized_packet() -> None:
+    # On an ordinary packet a zero length is malformed, not BIG TCP.
+    with pytest.raises(PacketParseError, match="smaller"):
+        parse_ipv4(build_ipv4(payload=bytes(10), total_length=0))
 
 
 def test_options_are_parsed() -> None:

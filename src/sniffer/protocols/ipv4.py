@@ -46,6 +46,7 @@ from sniffer.utils.checksum import internet_checksum
 _IPV4_HEADER: Final = struct.Struct("!BBHHHBBH4s4s")
 IPV4_MIN_HEADER_LEN: Final[int] = _IPV4_HEADER.size  # 20
 IPV4_MAX_HEADER_LEN: Final[int] = 15 * 4  # IHL is 4 bits, so at most 15 words
+IPV4_MAX_TOTAL_LEN: Final[int] = 0xFFFF  # Total Length is a 16-bit field
 
 # Bit masks for the 16-bit flags + fragment offset field:
 #   bit 15     bit 14   bit 13   bits 12..0
@@ -261,12 +262,14 @@ def parse_ipv4(data: bytes) -> IPv4Packet:
     # can be LONGER than total_length. We must cut there, or the padding
     # would be read as payload data.
     #
-    # total_length == 0 is a special case: with TSO/GSO or Linux "BIG TCP",
-    # the kernel can hand a sniffer a super-packet whose real length does
-    # not fit in 16 bits and sets this field to 0. Then the buffer is the
-    # only source of truth.
+    # total_length == 0 is a special case: with Linux "BIG TCP" (GSO/GRO
+    # super-packets), the real length does not fit in 16 bits, so the kernel
+    # sets this field to 0 and the buffer becomes the only source of truth.
+    # That can only be legitimate when the buffer really is bigger than
+    # 65,535 bytes. A zero on a normal-sized packet is malformed (or
+    # crafted), and accepting it would let padding pass as payload.
     truncated = False
-    if total_length == 0:
+    if total_length == 0 and len(data) > IPV4_MAX_TOTAL_LEN:
         end = len(data)
     elif total_length < header_len:
         raise PacketParseError(
