@@ -1,28 +1,33 @@
 """Command-line entry point: ``sudo python -m sniffer -i eth0 -c 10``.
 
-This module is the only place that knows about ``argparse``, ``print`` and
-exit codes. Capture and parsing live in their own modules and know nothing
-about the terminal. That separation (thin I/O shell, pure core) is what lets
-us test the core without a terminal or root, and later swap the output for
-a JSON log or a threaded pipeline without touching the parsers.
+This module is the only place that knows about ``argparse`` and exit codes.
+Capture, parsing, the threaded pipeline and output sinks live in their own
+modules. That separation (thin I/O shell, pure core) is what let Milestone 4
+add threads and JSON logging without touching a single parser.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
+import time
 from collections.abc import Sequence
-from datetime import datetime, timezone
 
 from sniffer import __version__
-from sniffer.capture import PacketType, RawFrame, RawSocketCapture
-from sniffer.decode import Transport, decode_frame
-from sniffer.exceptions import PacketParseError, SnifferError
-from sniffer.protocols.ipv4 import IPv4Packet
-from sniffer.protocols.tcp import TCPSegment
-from sniffer.protocols.udp import UDPDatagram
-from sniffer.utils.hexdump import hexdump
+from sniffer.alerts import (
+    AlertDispatcher,
+    AlertOutput,
+    ConsoleAlertOutput,
+    DetectorSink,
+    JsonAlertOutput,
+)
+from sniffer.capture import RawSocketCapture
+from sniffer.detection import DetectionConfig, Detector, HealthMonitor
+from sniffer.exceptions import SnifferError
+from sniffer.pipeline import DEFAULT_QUEUE_SIZE, DEFAULT_WORKERS, Pipeline, Sink
+from sniffer.sinks import ConsoleSink, JsonLinesSink
 
 logger = logging.getLogger("sniffer")
 
@@ -31,6 +36,25 @@ logger = logging.getLogger("sniffer")
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INTERRUPTED = 130
+
+_SUPERVISOR_TICK_S = 0.5
+_HEALTH_INTERVAL_S = 5.0  # how often the main thread checks for packet loss
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def _positive_float(text: str) -> float:
+    value = float(text)
+    # Reject inf and nan: float("inf") parses fine but a never-expiring
+    # window would let detector state grow without bound (see DetectionConfig).
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive, finite number")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-c",
         "--count",
-        type=int,
+        type=_positive_int,
         default=None,
         help="stop after this many frames (default: run until Ctrl+C)",
     )
@@ -77,6 +101,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="bytes to show per hex dump (default: 64)",
     )
     parser.add_argument(
+        "-w",
+        "--workers",
+        type=_positive_int,
+        default=DEFAULT_WORKERS,
+        help=f"decoder threads (default: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--queue-size",
+        type=_positive_int,
+        default=DEFAULT_QUEUE_SIZE,
+        metavar="N",
+        help=f"max frames buffered between threads (default: {DEFAULT_QUEUE_SIZE})",
+    )
+    parser.add_argument(
+        "-j",
+        "--json",
+        metavar="PATH",
+        help="append every packet as a JSON line to PATH",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="no per-packet console output (useful with --json)",
+    )
+    parser.add_argument(
+        "--stats",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="log pipeline health every SECONDS (default: off)",
+    )
+    _add_detection_arguments(parser)
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="enable debug logging"
     )
     parser.add_argument(
@@ -85,90 +143,167 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _checksum_label(valid: bool | None, pkttype: int) -> str:
-    """Turn a checksum result into ``ok``, ``BAD``, ``offload`` or ``n/a``.
-
-    Checksum offload: the kernel copies outgoing packets to sniffers BEFORE
-    the NIC finishes the TCP/UDP checksum (the field holds only the partial
-    pseudo-header sum, the kernel's CHECKSUM_PARTIAL state). So a "bad"
-    checksum on an OUTGOING packet is expected, not an attack. Labelling it
-    honestly avoids a flood of false alarms.
-    """
-    if valid is None:
-        return "n/a"
-    if valid:
-        return "ok"
-    return "offload" if pkttype == PacketType.OUTGOING else "BAD"
-
-
-def _endpoint(ip: IPv4Packet, transport: Transport | None) -> str:
-    """``a.b.c.d:port -> e.f.g.h:port``, or bare addresses without ports."""
-    if isinstance(transport, (TCPSegment, UDPDatagram)):
-        return f"{ip.src}:{transport.src_port} -> {ip.dst}:{transport.dst_port}"
-    return f"{ip.src} -> {ip.dst}"
-
-
-def format_frame(index: int, frame: RawFrame, *, show_ethernet: bool = False) -> str:
-    """Render one captured frame as a single summary line.
-
-    All protocol logic lives in ``decode_frame``. This function only turns
-    the decoded layers into text, so it is the only part that changes when
-    the output format changes (to JSON logs in Milestone 4, for example).
-    """
-    ts = datetime.fromtimestamp(frame.timestamp, tz=timezone.utc).strftime(
-        "%H:%M:%S.%f"
+def _add_detection_arguments(parser: argparse.ArgumentParser) -> None:
+    defaults = DetectionConfig()
+    group = parser.add_argument_group("threat detection (Milestone 5)")
+    group.add_argument(
+        "--no-detect", action="store_true", help="disable the detection engine"
     )
-    prefix = f"#{index:<5} {ts} {frame.interface:<8} {frame.direction:<9}"
-    try:
-        pkt = decode_frame(frame.data)
-    except PacketParseError as exc:
-        # A malformed frame must never crash a sniffer: log it and move on.
-        # Attackers send malformed packets precisely to crash parsers.
-        return f"{prefix} <malformed: {exc}>"
+    group.add_argument(
+        "--alerts",
+        metavar="PATH",
+        help="append every alert as a JSON line to PATH",
+    )
+    group.add_argument(
+        "--window",
+        type=_positive_float,
+        default=defaults.window_s,
+        metavar="SECONDS",
+        help=f"sliding window for rate rules (default: {defaults.window_s:g})",
+    )
+    group.add_argument(
+        "--syn-threshold",
+        type=_positive_int,
+        default=defaults.syn_flood_threshold,
+        metavar="N",
+        help="SYNs to one ip:port per window that count as a flood "
+        f"(default: {defaults.syn_flood_threshold})",
+    )
+    group.add_argument(
+        "--scan-ports",
+        type=_positive_int,
+        default=defaults.vertical_scan_ports,
+        metavar="N",
+        help="distinct ports on one host per window that count as a scan "
+        f"(default: {defaults.vertical_scan_ports})",
+    )
+    group.add_argument(
+        "--scan-hosts",
+        type=_positive_int,
+        default=defaults.horizontal_scan_hosts,
+        metavar="N",
+        help="distinct hosts on one port per window that count as a sweep "
+        f"(default: {defaults.horizontal_scan_hosts})",
+    )
+    group.add_argument(
+        "--cooldown",
+        type=float,
+        default=defaults.cooldown_s,
+        metavar="SECONDS",
+        help="minimum time between repeats of the same alert "
+        f"(default: {defaults.cooldown_s:g})",
+    )
 
-    ip = pkt.ip
-    if ip is None:
-        return f"{prefix} {pkt.ethernet.summary()}"
 
-    ip_chk = _checksum_label(ip.checksum_valid, frame.pkttype)
-    parts = [prefix, _endpoint(ip, pkt.transport), ip.protocol_name]
-    if pkt.transport is not None:
-        parts.append(pkt.transport.summary())
-        l4_chk = (
-            "partial"
-            if pkt.transport_checksum_partial
-            else _checksum_label(pkt.transport_checksum_valid, frame.pkttype)
+def _build_detection(
+    args: argparse.Namespace,
+) -> tuple[AlertDispatcher, DetectorSink] | None:
+    if args.no_detect:
+        return None
+    config = DetectionConfig(
+        window_s=args.window,
+        syn_flood_threshold=args.syn_threshold,
+        vertical_scan_ports=args.scan_ports,
+        horizontal_scan_hosts=args.scan_hosts,
+        cooldown_s=args.cooldown,
+    )
+    outputs: list[AlertOutput] = [ConsoleAlertOutput()]
+    if args.alerts is not None:
+        outputs.append(JsonAlertOutput(args.alerts))
+    dispatcher = AlertDispatcher(outputs)
+    return dispatcher, DetectorSink(Detector(config), dispatcher)
+
+
+def _build_sinks(args: argparse.Namespace) -> list[Sink]:
+    sinks: list[Sink] = []
+    if not args.quiet:
+        sinks.append(
+            ConsoleSink(
+                show_ethernet=args.ethernet,
+                hexdump_bytes=args.hexdump_bytes if args.hexdump else None,
+            )
         )
-    elif pkt.transport_error is not None:
-        parts.append(f"<malformed {ip.protocol_name}: {pkt.transport_error}>")
-        l4_chk = "n/a"
-    else:
-        l4_chk = "n/a"
-    if ip.is_fragment:
-        parts.append(f"frag@{ip.fragment_offset}{'+MF' if ip.more_fragments else ''}")
-    parts.append(f"ttl={ip.ttl} chk={ip_chk}/{l4_chk}")
-    line = " ".join(parts)
-    if show_ethernet:
-        line += f"\n{'':>41}{pkt.ethernet.summary()}"
-        line += f"\n{'':>41}{ip.summary()}"
-    return line
+    if args.json is not None:
+        sinks.append(JsonLinesSink(args.json))
+    return sinks
 
 
 def run(args: argparse.Namespace) -> int:
-    """Capture loop. Returns a process exit code."""
+    """Run the threaded pipeline. Returns a process exit code.
+
+    The main thread only supervises: it waits in short slices so it stays
+    responsive to Ctrl+C (Python delivers signals to the main thread only),
+    prints periodic stats, checks sensor health, and turns Ctrl+C into a
+    clean drain.
+    """
+    detection = _build_detection(args)
+    try:
+        return _run_pipeline(args, detection)
+    finally:
+        if detection is not None:
+            dispatcher, detector_sink = detection
+            logger.info("detection: %s", detector_sink.detector.stats.summary())
+            dispatcher.close()
+
+
+def _run_pipeline(
+    args: argparse.Namespace,
+    detection: tuple[AlertDispatcher, DetectorSink] | None,
+) -> int:
+    sinks = _build_sinks(args)
+    health: HealthMonitor | None = None
+    if detection is not None:
+        sinks.append(detection[1])
+        health = HealthMonitor()
     with RawSocketCapture(
         interface=args.interface, promiscuous=args.promiscuous
     ) as capture:
+        pipeline = Pipeline(
+            capture,
+            sinks,
+            workers=args.workers,
+            queue_size=args.queue_size,
+            count=args.count,
+        )
         logger.info(
-            "Capturing on %s%s. Press Ctrl+C to stop.",
+            "Capturing on %s%s with %d decoder thread(s), detection %s. "
+            "Press Ctrl+C to stop.",
             args.interface or "all interfaces",
             " (promiscuous)" if args.promiscuous else "",
+            args.workers,
+            "off" if detection is None else "on",
         )
-        for index, frame in enumerate(capture.frames(args.count), start=1):
-            print(format_frame(index, frame, show_ethernet=args.ethernet))
-            if args.hexdump:
-                print(hexdump(frame.data, max_bytes=args.hexdump_bytes), end="\n\n")
-    return EXIT_OK
+        pipeline.start()
+        interrupted = False
+        now = time.monotonic()
+        next_report = now + args.stats if args.stats else None
+        next_health = now + _HEALTH_INTERVAL_S
+        try:
+            while not pipeline.wait(timeout=_SUPERVISOR_TICK_S):
+                now = time.monotonic()
+                if next_report is not None and now >= next_report:
+                    logger.info("stats: %s", pipeline.stats().summary())
+                    next_report += args.stats
+                if health is not None and detection is not None and now >= next_health:
+                    stats = pipeline.stats()
+                    detection[0].emit(
+                        health.check(
+                            stats.captured, stats.queue_dropped, stats.kernel_drops
+                        )
+                    )
+                    next_health = now + _HEALTH_INTERVAL_S
+        except KeyboardInterrupt:
+            interrupted = True
+            logger.info("Stopping: draining queued packets...")
+        pipeline.stop()
+        stats = pipeline.stats()
+
+    logger.info("final: %s", stats.summary())
+    if pipeline.error is not None:
+        if isinstance(pipeline.error, SnifferError):
+            raise pipeline.error
+        raise SnifferError(f"Capture failed: {pipeline.error}") from pipeline.error
+    return EXIT_INTERRUPTED if interrupted else EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -186,8 +321,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.debug("Details:", exc_info=True)  # full chain with -v
         return EXIT_ERROR
     except KeyboardInterrupt:
-        # The `with` block has already closed the socket by the time we
-        # get here, so promiscuous mode is already off.
+        # A second Ctrl+C during the drain lands here. The `with` block has
+        # already closed the socket, so promiscuous mode is off.
         logger.info("Stopped by user.")
         return EXIT_INTERRUPTED
 

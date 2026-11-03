@@ -37,3 +37,7 @@ class InterfaceError(SnifferError):
 
 class PacketParseError(SnifferError):
     """Raised when a byte buffer is too short or malformed for a header."""
+
+
+class OutputError(SnifferError):
+    """Raised when an output destination (for example a JSON log) can't be used."""
