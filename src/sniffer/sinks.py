@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TextIO
 
 from sniffer.events import PacketEvent
+from sniffer.exceptions import OutputError
 from sniffer.formatting import format_event
 from sniffer.utils.hexdump import hexdump
 
@@ -55,7 +56,14 @@ class JsonLinesSink:
         # buffering=1 means line-buffered: each record reaches the OS as soon
         # as its newline is written, so `tail -f` sees it immediately and a
         # crash loses at most the line being written.
-        self._file = Path(path).open("a", encoding="utf-8", buffering=1)  # noqa: SIM115
+        try:
+            self._file = Path(path).open("a", encoding="utf-8", buffering=1)  # noqa: SIM115
+        except OSError as exc:
+            # A missing directory or a permission problem is a user-fixable
+            # mistake, so surface it as a clean CLI error, not a traceback.
+            raise OutputError(
+                f"Cannot open JSON log {str(path)!r}: {exc.strerror}"
+            ) from exc
 
     def handle(self, event: PacketEvent) -> None:
         """Write the event as one compact JSON line."""

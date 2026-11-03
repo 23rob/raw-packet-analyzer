@@ -6,8 +6,11 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from sniffer.capture import RawFrame
 from sniffer.events import PacketEvent
+from sniffer.exceptions import OutputError, SnifferError
 from sniffer.sinks import ConsoleSink, JsonLinesSink
 from tests.packets import build_frame, build_icmp, build_ipv4, build_tcp, build_udp
 
@@ -74,3 +77,12 @@ def test_console_sink_with_hexdump() -> None:
     text = out.getvalue()
     assert "TCP [SYN]" in text
     assert text.splitlines()[1].startswith("0000  02 fc")
+
+
+def test_json_sink_open_failure_is_a_clean_error(tmp_path: Path) -> None:
+    # Regression (Codex review on PR #3): used to escape as a raw OSError
+    # and print a traceback.
+    with pytest.raises(OutputError, match="Cannot open JSON log") as info:
+        JsonLinesSink(tmp_path / "missing-dir" / "packets.jsonl")
+    assert isinstance(info.value, SnifferError)
+    assert isinstance(info.value.__cause__, OSError)
