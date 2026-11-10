@@ -3,8 +3,8 @@
 A network packet sniffer and traffic analyzer written **from scratch in Python**,
 using only the standard library. It reads frames straight from the Linux kernel
 with `AF_PACKET` raw sockets, decodes protocol headers byte by byte with
-`struct` and bitwise operations, and (in later milestones) feeds a
-multi-threaded pipeline and a threat detection engine.
+`struct` and bitwise operations, then feeds a multi-threaded pipeline and a
+threat detection engine.
 
 No Scapy, no libpcap, no third-party runtime dependencies.
 
